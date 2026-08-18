@@ -2,6 +2,77 @@
 
 ## Unreleased
 
+## 1.14.9 - 2026-08-18
+
+### New Features
+- Added a strategy-lab historical research window bridge.
+
+### Bug Fixes
+- Defaulted multi-account scan parallelism to the full account count when `runtime.multi_account_max_workers` is unset, so every account's opening-candidate decision stays within the option-snapshot freshness window (fixes sy's shared snapshot going stale and all its US sell-put candidates being rejected). Explicitly setting the value still caps parallelism.
+
+### Improvements
+- Made circuit-breaker `probe_max_accounts` an internal constant (1) instead of a user-facing config key — a half-open probe only needs one representative account, and exposing it added a config surface that could drift.
+- `pipeline_watchlist` now raises on an unknown `use` template reference instead of silently dropping the symbol's merged config (defense in depth; validate/build already rejects it).
+
+## 1.14.8 - 2026-08-18
+
+### Bug Fixes
+- Marked conversation-memory tool findings as historical snapshots so Copilot re-queries live read-only tools for candidate/run/position/notification questions instead of repeating stale conclusions (e.g. "0700 腾讯为什么被过滤" 复读旧结果而报「本轮未取得可验证的当前证据」).
+
+## 1.14.7 - 2026-08-18
+
+### Bug Fixes
+- Fixed auto-close-expired opening an empty SQLite ledger in the release directory instead of the real runtime store, which caused a concurrent "locking protocol" failure when both accounts ran against the same wrong file.
+- Corrected decision-brief batch time and null evidence rendering.
+
+## 1.14.6 - 2026-08-17
+
+### Improvements
+- Report the offending field name when decision-state normalization rejects a non-finite numeric value, making candidate-seal NaN failures diagnosable.
+
+## 1.14.5 - 2026-08-17
+
+### New Features
+- Integrated the Pi Agent Core process boundary (S1): a real child-process agent runtime with cancel/exit classification, stderr diagnostics, and a read-only tool bridge (S2).
+
+### Bug Fixes
+- Tolerated expiration-date ordering differences between the prefetch projection and side plans, fixing the US market-open first batch failing with "required-data projected expirations contradict side plans" when OpenD returned expirations out of chronological order.
+- Aligned the Top1 research window to 20 days and the validation window to 10 days.
+
+## 1.14.4 - 2026-08-17
+
+### Bug Fixes
+- Replaced the unreliable OpenD total-assets ratio exchange-rate derivation with a single market source (Tencent primary, Sina fallback), fixing decision-brief "折CNY" amounts that used a false USDCNY≈4.72 instead of ≈6.74.
+- Forced `refresh_cache=True` on the OpenD account-balance query so stale fund snapshots no longer understate money-fund balances and produce a bogus negative "available to open options".
+
+## 1.14.3 - 2026-08-17
+
+### Bug Fixes
+- Fixed HK decision-brief batches failing with "required-data CSV differs outside multiplier enrichment" when provider-projection and pipeline-CSV floats landed a few ULP apart (observed up to 3 ULP on otm_pct during lunch-reopen batches); blob validation now uses a 1e-12 relative tolerance, far tighter than any financial meaning.
+- Made fresh-evidence recheck fail closed when no current observation was obtained, and preserved quote snapshots when the multiplier cache skips enrichment.
+
+## 1.14.2 - 2026-08-17
+
+### Bug Fixes
+- Fixed OpenD probe paths (healthcheck, trading-day guard, trade push/backfill services) hanging indefinitely in the futu SDK reconnect loop when the gateway is offline; they now fail fast with a typed UNREACHABLE error.
+
+## 1.14.1 - 2026-08-17
+
+### New Features
+- Added a durable lifecycle-attempt audit pipeline that atomically binds broker observations, evidence, audit chains, restart reconciliation, and run seals to the existing SQLite ledger and controlled runtime flow.
+- Added current-decision projections with atomic writer fences, indexed current-state reads, migration and shadow verification, and query-only quality and performance consumers.
+- Added immutable per-account runtime portfolio snapshots that bind prepared portfolio inputs, current decision facts, source receipts, and replay references without rereading historical state.
+- Added content-addressed required-data scan blobs with canonical-first consumers, exact reachable-blob archive sync, and read-only retention and garbage-collection previews while retaining legacy compatibility during the migration window.
+- Added immutable Shadow Replay generations and a gated read-only historical-cleanup preview that verifies downstream cutover evidence before identifying removable legacy artifacts.
+
+## 1.14.0 - 2026-08-16
+
+### New Features
+- Added an opt-in experimental HK/lx Sell Put Top1 optimization loop that captures official recommendation points, compares baseline and challenger ranking profiles on a frozen 40-trading-day research corpus, validates the locked challenger over a separate 20-trading-day hidden window, and advances through an auditable scheduled runner without changing production strategy configuration or automatically adopting a winner. Its explicit W0R preflight records compact HK calendar, account fee-plan, quote, exact-expiration terms, history-quota, and exact-expiration close receipts while keeping raw provider responses out of storage.
+
+### Improvements
+- Reduced candidate scanning, Close Advice loading, alert rendering, and combo construction overhead by replacing pandas row iteration in hot paths with record materialization and by reusing the materialized put-leg set across call combinations.
+
 ## 1.13.23 - 2026-08-14
 
 ### Bug Fixes

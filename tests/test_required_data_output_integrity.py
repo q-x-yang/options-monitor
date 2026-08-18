@@ -11,6 +11,7 @@ import pytest
 
 from conftest import phase2_opening_row
 from domain.domain.engine import calculate_opening_candidate_metrics
+from src.application import multiplier_cache
 from src.application.candidate_models import CandidateContractInput
 from src.application.close_advice_quote_cache import quote_cache_metadata_path
 from src.application.opend_symbol_outputs import (
@@ -1145,14 +1146,13 @@ def test_finalizer_attests_multiplier_and_final_csv_hash(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    from src.application import multiplier_cache
-
     monkeypatch.setattr(
         multiplier_cache,
         "resolve_multiplier",
         lambda **_kwargs: 100.0,
     )
     payload = _payload(multiplier=None)
+    payload["rows"][0]["implied_volatility"] = 0.13436424411240122
     result = finalize_required_data_quote_candidate(
         base=tmp_path,
         producer_root=tmp_path,
@@ -1177,6 +1177,33 @@ def test_finalizer_attests_multiplier_and_final_csv_hash(
     assert datetime.fromisoformat(
         metadata["source_observed_at"].replace("Z", "+00:00")
     ) == NOW
+    assert result["quote_receipt_path"].is_file()
+
+
+def test_finalizer_keeps_valid_multiplier_csv_canonical(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        multiplier_cache,
+        "resolve_multiplier",
+        lambda **_kwargs: 100.0,
+    )
+    payload = _payload(multiplier=100.0)
+    payload["rows"][0]["implied_volatility"] = 0.13436424411240122
+
+    result = finalize_required_data_quote_candidate(
+        base=tmp_path,
+        producer_root=tmp_path,
+        producer_run_id="run-valid-multiplier",
+        symbol="NVDA",
+        expected_fetch_contract=_contract(),
+        fetch_policy=_policy(),
+        mode="fresh",
+        payload=payload,
+        now=COMPLETED_AT,
+    )
+
     assert result["quote_receipt_path"].is_file()
 
 
@@ -1662,3 +1689,30 @@ def test_direct_publisher_rejects_child_rv_drift_without_receipt(
         )
 
     assert _receipt_paths(tmp_path) == []
+
+
+def test_blob_projection_accepts_float_last_bit_and_ulp_drift() -> None:
+    """Production 2026-08-17 lunch-reopen data differed by up to 3 ULP on otm_pct.
+
+    The strict CSV comparison must treat those as equivalent; only multiplier
+    may differ.
+    """
+
+    from src.application.required_data_blobs import _equivalent_csv_number
+
+    # 1-ULP drift (0.48621000000000003 vs 0.48621)
+    assert _equivalent_csv_number("0.48621000000000003", "0.48621")
+    # 3-ULP drift (production 0700.HK row0 otm_pct)
+    assert _equivalent_csv_number("0.19463087248322147", "0.1946308724832214")
+    # 1-ULP drift on a small-magnitude value
+    assert _equivalent_csv_number("0.26662320730117345", "0.2666232073011734")
+    # exact values stay equivalent
+    assert _equivalent_csv_number("0.42", "0.42")
+    assert _equivalent_csv_number("5", "5")
+    # material differences must still be rejected
+    assert not _equivalent_csv_number("0.42", "0.43")
+    assert not _equivalent_csv_number("1e3", "1e3.5")
+    # non-numeric strings are not numbers
+    assert not _equivalent_csv_number("N/A", "N/A")
+    assert not _equivalent_csv_number("", "0")
+

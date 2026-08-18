@@ -4,21 +4,49 @@ from typing import Any
 
 from src.application.agent_tool_contracts import AgentToolError
 from src.application.agent_tools.base import AgentTool, build_agent_tool
+from src.application.quality.gate import (
+    quality_payload_has_lifecycle_rows,
+    record_quality_consumer_read,
+)
 from src.application.quality.service import OMQualityService
 
 
 def _quality_status_tool(
     payload: dict[str, Any],
 ) -> tuple[dict[str, Any], list[str], dict[str, Any]]:
-    status = OMQualityService().read_published()
+    account = str(payload.get("account") or "").strip().lower()
+    market = str(payload.get("market") or "").strip().lower()
+    dataset_id = str(payload.get("dataset_id") or "").strip()
+    service = OMQualityService()
+    legacy_requested = dataset_id in {
+        "om.lifecycle_evidence",
+        "om.lifecycle_history",
+    }
+    if legacy_requested:
+        status = service.read_integrity_published()
+        record_quality_consumer_read(
+            consumer="quality_status",
+            account=account or None,
+            market=market or None,
+            lifecycle_rows_requested=True,
+            lifecycle_rows_returned=quality_payload_has_lifecycle_rows(
+                status,
+                account=account or None,
+                market=market or None,
+            ),
+        )
+    else:
+        status = service.read_published(
+            consumer="quality_status",
+            account=account or None,
+            market=market or None,
+            lifecycle_rows_requested=False,
+        )
     if status is None:
         raise AgentToolError(
             code="QUALITY_STATUS_UNAVAILABLE",
             message="No valid published OM quality status is available.",
         )
-    account = str(payload.get("account") or "").strip().lower()
-    market = str(payload.get("market") or "").strip().lower()
-    dataset_id = str(payload.get("dataset_id") or "").strip()
     if not any((account, market, dataset_id)):
         return status, [], {"artifact": "om-quality-status"}
     projected = dict(status)

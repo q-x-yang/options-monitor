@@ -180,6 +180,73 @@ explicit. Capacity warnings and cold-candidate rows are read-only decision
 previews; this command has no move, delete, compact, checkpoint, repair, or
 notification action.
 
+Canonical scan-blob garbage collection has a separate read-only preview:
+
+```bash
+./om research storage-gc-preview --runtime-root /var/lib/options-monitor
+```
+
+It keeps runs within 14 days or among the latest 200, verifies every blob
+reachable from protected manifests, and reports only unreachable blobs older
+than the 24-hour orphan grace period. Any invalid protected manifest or
+missing/corrupt referenced blob suppresses all candidates. There is no confirm
+or delete mode.
+
+Historical cleanup has a separate gated preview:
+
+```bash
+./om research storage-cleanup-preview \
+  --runtime-root /var/lib/options-monitor \
+  --lifecycle-inventory ./lifecycle-migration-inventory.json \
+  --quality-cutover-evidence ./quality-cutover-evidence.json \
+  --backup-proof ./historical-cleanup-backup-proof.json \
+  --history-report ./baseline-previous.json
+```
+
+The first run can omit `--backup-proof` to obtain
+`expected_backup_bindings`; it remains `not_ready` and emits no candidates.
+The proof must describe a standalone, integrity-checked SQLite backup whose
+logical contents and projection/lifecycle bindings match the live ledger.
+This command is preview-only: it never moves, deletes, vacuums, or rewrites
+data, and it has no `--confirm` or `--delete` mode. Even a ready result only
+authorizes a later operator decision. Legacy required-data CSV/base64 files,
+ledger history rows, and research generation roots are explicitly excluded.
+Actual cleanup requires separate authorization and an implemented write path.
+
+Sealed required-data snapshots also publish one deterministic gzip payload per
+symbol at
+`output_shared/blobs/sha256/<first-two-hex>/<sha256>.json.gz`; the run's
+`state/required_data_snapshot_manifest.json` is the commit/root that retains the
+exact blob reference. During the compatibility window the producer still writes
+the legacy JSON, CSV, and inline base64 fields. A sealed reader prefers the blob
+when its reference exists, falls back only when the reference is absent, and
+fails closed instead of hiding a bad reference with legacy data. Shadow Replay
+surfaces payload-free `required_data_read_source_counts` and
+`required_data_legacy_read_count`; archive collection transfers only blob hashes
+reachable from selected run roots, never the whole shared blob store.
+
+The frozen consumer boundary is deliberate: ordinary scan/filter steps receive
+the single frame materialized by the sealed snapshot resolver; Close Advice,
+Daily Brief, Shadow Replay, and Strategy Lab consume the same sealed bytes.
+Prefetch, multiplier enrichment, coverage checks, quote-cache validation, and
+request-local materialization tools operate before sealing and therefore still
+use their producer workspace. Archive CSV checks are legacy-presence checks,
+while archive retention and replay use manifest blob references.
+
+The Phase 6 storage harness uses a checked-in metadata-only p99 descriptor and
+deterministic synthetic rows; it has no production-runtime input:
+
+```bash
+./.venv/bin/python scripts/benchmark_required_data_scan_blobs.py \
+  --profile canonical --output docs/gateflow/scan-blob-canonical-performance.json
+./.venv/bin/python scripts/benchmark_required_data_scan_blobs.py \
+  --profile dual_output --output docs/gateflow/scan-blob-dual-output-performance.json
+```
+
+The default 5 warmups and 30 repetitions are the formal labels. Lower counts
+are plumbing smoke only. Formal benchmark receipts remain gitignored process
+evidence and are not source-release artifacts.
+
 To measure the current canonical position projector and the real SQLite full-
 replay writer on deterministic synthetic data:
 
@@ -292,6 +359,7 @@ Important runtime paths:
 | Current pointers | `output_shared/state/current/` |
 | Per-account output | `output_accounts/<account>/` |
 | Run snapshots | `output_runs/<run_id>/` |
+| Compact runtime shadow | `output_runs/<run_id>/accounts/<account>/state/runtime_portfolio_snapshot.v1.json` |
 | Default reports | `output_shared/reports/` |
 | OpenD cache | `cache/opend_option_chain/`, `cache/opend_option_expirations/` |
 | Audit logs | `audit/run_logs/` |
@@ -344,6 +412,8 @@ When remote storage is constrained, use `./om research archive pull --remote pro
 
 For an explicit local dataset, use `./om research shadow-replay build --run-id <run-id>`, then inspect `./om research shadow-replay status --min-sample 30 --min-mark-points 2 --mark-stale-hours 24` to see each dataset's next data-lifecycle action. `data_plan` contains only executable data-maintenance actions (`collect_marks` / `settle`), while `review_queue` lists datasets ready for explicit manual `analyze`. Use `./om research shadow-replay run-data-plan` as the independent low-frequency maintenance entry: it is dry-run by default with no receipt write, and only `--write` executes eligible `collect_marks` / `settle` actions and writes a local receipt. It must not execute `analyze`; manual review stays on the explicit `analyze` command. Collect path samples with `./om research shadow-replay collect-marks --dataset <dataset-dir> --source local --write` or explicit OpenD sampling via `--source opend --write`. OpenD sampling refreshes local required-data cache before appending this point-in-time mark, and may update local OpenD rate-limit state / option-chain cache; it cannot recover past option marks that were never collected. OpenD preview without `--write` uses temporary paths and does not persist those files. You can still run the lower-level `mark`, `settle`, and `analyze` commands directly. Build, local collect, mark, and settle only write local replay evidence; OpenD collect also writes local evidence/cache files only. Missing required-data quotes are recorded as `missing_quote` evidence gaps and are not usable marks; expiry spot-only marks can be used for expiration outcome facts.
 
+Each Shadow Replay manifest binds an immutable generation under the dataset's `generations/` directory. Generations reuse content-addressed partitions under `partitions/sha256/`; the mutable JSONL files remain compatibility views, while Strategy Lab evidence stays bound to the exact generation it used. Do not delete old generation manifests or partitions directly; use the storage status and preview surfaces so referenced evidence remains recoverable.
+
 Use `outcome_by_bucket` from the analysis output to review DTE, Delta, IV/RV, spread, and concentration buckets before proposing filter or ranking changes.
 
 ### Tick Runtime
@@ -370,6 +440,7 @@ Tick flow:
       -> required_data prefetch
       -> pipeline_runtime / pipeline_watchlist / pipeline_symbol
       -> optional close advice
+      -> immutable compact runtime shadow after terminal candidate commit
       -> per-account metrics and notification text
    -> tick_notification_flow  # scheduled only: Daily Decision Brief ordinary delivery
    -> run state and audit writes
@@ -384,6 +455,12 @@ parent and scan-child consumers use the retained generation instead of reopening
 replacement cannot split one run across two configs. Account labels are canonical lowercase path components
 (`[a-z0-9][a-z0-9_-]{0,63}`); an explicit empty scope, unsafe label, or symlinked artifact ancestor fails closed before
 run artifacts or config publication.
+
+After a scanned account commits its terminal candidate manifest, Tick publishes the account-scoped compact runtime
+snapshot above with write-once/adopt semantics. It is replay evidence and a shadow comparison surface only: legacy
+files, `AccountResult`, ranking, notification, and delivery remain authoritative. Missing, malformed, or conflicting
+compact data is reported as account-scoped `data_unavailable` and never repaired or substituted into the legacy path;
+rollback is removal of the compact consumer/call, not a history rewrite or runtime-data deletion.
 
 Prepared portfolio payloads use content-addressed names and a write-once/adopt manifest. The parent retains the manifest
 SHA-256 and passes it to the final scan child; both consumers therefore load the same prepared generation. The loader

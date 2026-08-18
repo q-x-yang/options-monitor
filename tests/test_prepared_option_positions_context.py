@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from src.application.prepared_option_positions_context import (
     PreparedOptionPositionsContextError,
     cny_per_currency_rates_from_option_context,
     load_prepared_option_positions_context,
+    load_prepared_option_positions_context_receipt,
     prepare_option_positions_contexts,
 )
 from src.application.tick_run_workspace import publish_account_run_config
@@ -160,18 +162,27 @@ def test_prepare_publishes_zero_position_slices_from_one_ledger_and_fx_read(
     )
     fx_calls: list[list[str]] = []
 
-    def _rates(configs):
-        fx_calls.append([account for account, _config in configs])
+    def _rates(cache_path=None, **_kwargs):
+        fx_calls.append(str(cache_path))
         return {
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "source": "opend_account_funds_conversion",
+            "source": "tencent_quote",
             "rates": {"USDCNY": 7.2, "HKDCNY": 0.92},
         }
 
     monkeypatch.setattr(
         mod,
-        "fetch_opend_exchange_rate_observation",
+        "get_exchange_rates_or_fetch_latest",
         _rates,
+    )
+
+    def _current_read_fails(*_args, **_kwargs):
+        raise RuntimeError("shadow unavailable")
+
+    monkeypatch.setattr(
+        mod,
+        "read_current_decision_projection",
+        _current_read_fails,
     )
 
     batch = prepare_option_positions_contexts(
@@ -186,7 +197,7 @@ def test_prepare_publishes_zero_position_slices_from_one_ledger_and_fx_read(
     assert batch.ledger_read_count == 1
     assert batch.fx_observation_count == 1
     assert len(fx_calls) == 1
-    assert fx_calls == [["lx", "sy"]]
+    assert fx_calls[0].endswith("rate_cache.json")
     assert batch.unavailable_by_account == {}
     assert set(batch.manifests) == {"lx", "sy"}
 
@@ -212,6 +223,29 @@ def test_prepare_publishes_zero_position_slices_from_one_ledger_and_fx_read(
         assert loaded[account]["raw_selected_count"] == 0
         assert loaded[account]["open_positions_min"] == []
         assert loaded[account]["decision_snapshot_status"] == "trusted"
+        assert loaded[account]["current_decision_shadow"] == loaded[account][
+            "decision_state_snapshot"
+        ]["current_decision_shadow"]
+        assert loaded[account]["current_decision_shadow"]["status"] == (
+            "not_available"
+        )
+        assert loaded[account]["current_decision_shadow"]["reason"] == (
+            "current_projection_read_failed:RuntimeError"
+        )
+        receipt = load_prepared_option_positions_context_receipt(
+            manifest_path=Path(manifest["manifest_path"]),
+            expected_base=tmp_path,
+            expected_run_id=run_id,
+            expected_account=account,
+            expected_account_config_sha256=authorities[account].account_config_sha256,
+            expected_manifest_sha256=manifest["manifest_sha256"],
+            expected_runtime_config=configs[account],
+        )
+        assert receipt["payload"] == loaded[account]
+        assert (
+            receipt["manifest"]["application_received_at_utc"]
+            == (loaded[account]["prepared_authority"]["application_received_at_utc"])
+        )
 
     assert loaded["lx"]["as_of_utc"] == loaded["sy"]["as_of_utc"]
     assert (
@@ -228,6 +262,47 @@ def test_prepare_publishes_zero_position_slices_from_one_ledger_and_fx_read(
             "fx_observation_sha256"
         ]
     )
+
+    sy_manifest_path = Path(batch.manifests["sy"]["manifest_path"])
+    sy_manifest = json.loads(sy_manifest_path.read_text(encoding="utf-8"))
+    sy_manifest["application_received_at_utc"] = "2026-08-10T03:00:01+00:00"
+    sy_manifest_bytes = (
+        json.dumps(
+            sy_manifest,
+            ensure_ascii=False,
+            sort_keys=True,
+            indent=2,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode()
+    sy_manifest_path.write_bytes(sy_manifest_bytes)
+    sy_manifest_sha256 = hashlib.sha256(sy_manifest_bytes).hexdigest()
+    assert (
+        load_prepared_option_positions_context(
+            manifest_path=sy_manifest_path,
+            expected_base=tmp_path,
+            expected_run_id=run_id,
+            expected_account="sy",
+            expected_account_config_sha256=authorities["sy"].account_config_sha256,
+            expected_manifest_sha256=sy_manifest_sha256,
+            expected_runtime_config=configs["sy"],
+        )
+        == loaded["sy"]
+    )
+    with pytest.raises(
+        PreparedOptionPositionsContextError,
+        match="application_received_at_utc",
+    ):
+        load_prepared_option_positions_context_receipt(
+            manifest_path=sy_manifest_path,
+            expected_base=tmp_path,
+            expected_run_id=run_id,
+            expected_account="sy",
+            expected_account_config_sha256=authorities["sy"].account_config_sha256,
+            expected_manifest_sha256=sy_manifest_sha256,
+            expected_runtime_config=configs["sy"],
+        )
 
     lx_manifest = batch.manifests["lx"]
     payload_path = (
@@ -298,10 +373,10 @@ def test_one_ledger_freezes_account_isolated_option_contexts(
 
     monkeypatch.setattr(
         mod,
-        "fetch_opend_exchange_rate_observation",
-        lambda _configs: {
+        "get_exchange_rates_or_fetch_latest",
+        lambda cache_path=None, **_kwargs: {
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "source": "opend_account_funds_conversion",
+            "source": "tencent_quote",
             "rates": {"USDCNY": 7.2, "HKDCNY": 0.92},
         },
     )

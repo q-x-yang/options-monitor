@@ -110,6 +110,102 @@ def test_projection_migration_writes_require_apply_and_confirmation(
     }
 
 
+@pytest.mark.parametrize(
+    ("command", "function_name"),
+    (
+        ("inventory", "build_current_decision_projection_migration_inventory"),
+        ("verify", "verify_current_decision_projection_migration"),
+        ("status", "current_decision_projection_migration_status"),
+    ),
+)
+def test_decision_projection_reads_use_resolved_store_without_write_guard(
+    command: str,
+    function_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import src.interfaces.cli.option_positions as cli_mod
+
+    data_config = tmp_path / "data.json"
+    data_config.write_text("{}\n", encoding="utf-8")
+    sqlite_path = tmp_path / "ledger.sqlite3"
+    sqlite_path.touch()
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        cli_mod,
+        "resolve_ledger_store",
+        lambda *_args, **_kwargs: SimpleNamespace(sqlite_path=sqlite_path),
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        function_name,
+        lambda path: captured.update(path=path) or {"path": str(path)},
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "_guard_write",
+        lambda **_kwargs: pytest.fail("read command invoked write guard"),
+    )
+
+    assert cli_mod.main(
+        ["--data-config", str(data_config), "decision-projection", command]
+    ) == 0
+    assert captured["path"] == sqlite_path
+    assert json.loads(capsys.readouterr().out) == {"path": str(sqlite_path)}
+
+
+def test_decision_projection_apply_requires_manifest_and_high_risk_confirmation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import src.interfaces.cli.option_positions as cli_mod
+
+    data_config = tmp_path / "data.json"
+    data_config.write_text("{}\n", encoding="utf-8")
+    manifest = tmp_path / "inventory.json"
+    manifest.write_text('{"schema_version":"test"}\n', encoding="utf-8")
+    sqlite_path = tmp_path / "ledger.sqlite3"
+    sqlite_path.touch()
+    common = [
+        "--data-config",
+        str(data_config),
+        "decision-projection",
+        "apply",
+        "--manifest",
+        str(manifest),
+    ]
+
+    with pytest.raises(SystemExit, match="requires --apply"):
+        cli_mod.main(common)
+    with pytest.raises(SystemExit, match="use --confirm or --yes"):
+        cli_mod.main([*common, "--apply"])
+
+    monkeypatch.setattr(cli_mod, "_guard_write", lambda **_kwargs: {"ok": True})
+    monkeypatch.setattr(
+        cli_mod,
+        "resolve_ledger_store",
+        lambda *_args, **_kwargs: SimpleNamespace(sqlite_path=sqlite_path),
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "apply_current_decision_projection_migration",
+        lambda path, payload: {
+            "operation": "apply",
+            "path": str(path),
+            "input_schema": payload["schema_version"],
+        },
+    )
+
+    assert cli_mod.main([*common, "--apply", "--yes"]) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "operation": "apply",
+        "path": str(sqlite_path),
+        "input_schema": "test",
+    }
+
+
 def test_projection_migration_activate_requires_both_evidence_files(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1664,6 +1760,338 @@ def test_option_positions_cli_lifecycle_reconcile_dry_run_then_apply_discovery(
     assert len(applied["discovery"]["created_case_ids"]) == 1
     assert applied["read_models"][0]["lifecycle_state"] == "settlement_pending"
     assert len(repo.list_trade_lifecycle_cases()) == 1
+
+
+def test_option_positions_cli_reconcile_due_preview_does_not_build_gateways(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import src.interfaces.cli.option_positions as cli_mod
+
+    data_config = _write_data_config(
+        tmp_path / "data.json",
+        sqlite_path=tmp_path / "option_positions.sqlite3",
+    )
+    runtime_config = tmp_path / "runtime.json"
+    runtime_config.write_text("{}\n", encoding="utf-8")
+    repo = ledger_repository.SQLiteOptionPositionsRepository(
+        tmp_path / "option_positions.sqlite3"
+    )
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        cli_mod,
+        "resolve_option_positions_repo",
+        lambda **_kwargs: (data_config, repo),
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "resolve_trade_intake_config",
+        lambda _cfg: {
+            "sources": [
+                {
+                    "id": "lx",
+                    "account": "lx",
+                    "futu_account_ids": ["1001"],
+                }
+            ]
+        },
+    )
+
+    def fail_gateway(**kwargs):
+        raise AssertionError(f"gateway built during preview: {kwargs}")
+
+    monkeypatch.setattr(
+        cli_mod,
+        "build_ready_futu_broker_gateway",
+        fail_gateway,
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "build_ready_futu_quote_gateway",
+        fail_gateway,
+    )
+
+    def reconcile(_repo, **kwargs):
+        captured.update(kwargs)
+        return {"results": [], "status": "ok"}
+
+    monkeypatch.setattr(
+        cli_mod,
+        "reconcile_due_lifecycle_cases_for_source",
+        reconcile,
+    )
+
+    assert (
+        cli_mod.main(
+            [
+                "--data-config",
+                str(data_config),
+                "lifecycle",
+                "reconcile-due",
+                "--account",
+                "lx",
+                "--config",
+                str(runtime_config),
+                "--observed-at-ms",
+                "123",
+                "--dry-run",
+                "--format",
+                "json",
+            ]
+        )
+        == 0
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["dry_run"] is True
+    assert captured["apply_changes"] is False
+    assert "broker_gateway" not in captured
+    assert "quote_gateway" not in captured
+
+
+@pytest.mark.parametrize(
+    ("seal_status", "expected_return_code"),
+    [("not_required", 0), ("seal_persist_failed", 1)],
+)
+def test_option_positions_cli_reconcile_due_apply_checkpoints_before_gateways(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    seal_status: str,
+    expected_return_code: int,
+) -> None:
+    import src.interfaces.cli.option_positions as cli_mod
+
+    data_config = _write_data_config(
+        tmp_path / "data.json",
+        sqlite_path=tmp_path / "option_positions.sqlite3",
+    )
+    runtime_config = tmp_path / "runtime.json"
+    runtime_config.write_text("{}\n", encoding="utf-8")
+    repo = ledger_repository.SQLiteOptionPositionsRepository(
+        tmp_path / "option_positions.sqlite3"
+    )
+    order: list[str] = []
+    monkeypatch.setattr(
+        cli_mod,
+        "resolve_option_positions_repo",
+        lambda **_kwargs: (data_config, repo),
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "resolve_trade_intake_config",
+        lambda _cfg: {
+            "sources": [
+                {
+                    "id": "lx",
+                    "account": "lx",
+                    "audit_path": "audit.jsonl",
+                    "futu_account_ids": ["1001"],
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "resolve_account_broker_binding_sets",
+        lambda _items: {
+            "lx": SimpleNamespace(
+                ok=True,
+                host="127.0.0.1",
+                port=11111,
+                required_account_ids=("1001",),
+                trd_env="REAL",
+            )
+        },
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "resolve_futu_quote_route",
+        lambda _cfg: SimpleNamespace(
+            ok=True,
+            host="127.0.0.1",
+            port=11111,
+        ),
+    )
+    original_checkpoint = cli_mod.append_lifecycle_attempt_checkpoint_seal
+
+    def checkpoint(*args, **kwargs):
+        order.append("checkpoint")
+        return original_checkpoint(*args, **kwargs)
+
+    class Gateway:
+        def close(self):
+            return None
+
+    def gateway(kind: str):
+        def build(**_kwargs):
+            order.append(kind)
+            assert (tmp_path / "audit.jsonl").is_file()
+            return Gateway()
+
+        return build
+
+    monkeypatch.setattr(
+        cli_mod,
+        "append_lifecycle_attempt_checkpoint_seal",
+        checkpoint,
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "build_ready_futu_broker_gateway",
+        gateway("broker"),
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "build_ready_futu_quote_gateway",
+        gateway("quote"),
+    )
+
+    def reconcile(_repo, **kwargs):
+        order.append("runtime")
+        assert callable(kwargs["seal_sink"])
+        return {
+            "account": "lx",
+            "source_id": "lx",
+            "results": [],
+            "seal_status": seal_status,
+            "run_seal": None,
+        }
+
+    monkeypatch.setattr(
+        cli_mod,
+        "reconcile_due_lifecycle_cases_for_source",
+        reconcile,
+    )
+
+    assert (
+        cli_mod.main(
+            [
+                "--data-config",
+                str(data_config),
+                "lifecycle",
+                "reconcile-due",
+                "--runtime-root",
+                str(tmp_path),
+                "--account",
+                "lx",
+                "--config",
+                str(runtime_config),
+                "--apply",
+                "--confirm",
+                "--format",
+                "json",
+            ]
+        )
+        == expected_return_code
+    )
+
+    assert order == ["checkpoint", "broker", "quote", "runtime"]
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["seal_status"] == seal_status
+
+
+def test_option_positions_cli_checkpoint_failure_blocks_gateways(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import src.interfaces.cli.option_positions as cli_mod
+
+    data_config = _write_data_config(
+        tmp_path / "data.json",
+        sqlite_path=tmp_path / "option_positions.sqlite3",
+    )
+    runtime_config = tmp_path / "runtime.json"
+    runtime_config.write_text("{}\n", encoding="utf-8")
+    repo = ledger_repository.SQLiteOptionPositionsRepository(
+        tmp_path / "option_positions.sqlite3"
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "resolve_option_positions_repo",
+        lambda **_kwargs: (data_config, repo),
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "resolve_trade_intake_config",
+        lambda _cfg: {
+            "sources": [
+                {
+                    "id": "lx",
+                    "account": "lx",
+                    "audit_path": "audit.jsonl",
+                    "futu_account_ids": ["1001"],
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "resolve_account_broker_binding_sets",
+        lambda _items: {
+            "lx": SimpleNamespace(
+                ok=True,
+                host="127.0.0.1",
+                port=11111,
+                required_account_ids=("1001",),
+                trd_env="REAL",
+            )
+        },
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "resolve_futu_quote_route",
+        lambda _cfg: SimpleNamespace(
+            ok=True,
+            host="127.0.0.1",
+            port=11111,
+        ),
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "append_lifecycle_attempt_checkpoint_seal",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("disk full")
+        ),
+    )
+    gateway_calls = 0
+
+    def fail_gateway(**_kwargs):
+        nonlocal gateway_calls
+        gateway_calls += 1
+        raise AssertionError("gateway must remain unopened")
+
+    monkeypatch.setattr(
+        cli_mod,
+        "build_ready_futu_broker_gateway",
+        fail_gateway,
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "build_ready_futu_quote_gateway",
+        fail_gateway,
+    )
+
+    with pytest.raises(SystemExit, match="seal_persist_failed: OSError"):
+        cli_mod.main(
+            [
+                "--data-config",
+                str(data_config),
+                "lifecycle",
+                "reconcile-due",
+                "--runtime-root",
+                str(tmp_path),
+                "--account",
+                "lx",
+                "--config",
+                str(runtime_config),
+                "--apply",
+                "--confirm",
+            ]
+        )
+
+    assert gateway_calls == 0
 
 
 def test_option_positions_cli_lifecycle_confirm_expired_alias_path_is_retired(

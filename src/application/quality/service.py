@@ -8,15 +8,34 @@ from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
+from domain.domain.ledger.position_fields import effective_multiplier
 from src.application.account_config import accounts_from_config
 from src.application.agent_tool_config import load_runtime_config, repo_base
 from src.application.ledger.api import (
     lifecycle_account_coherent_facts,
     open_trade_reconciliation_evidence_repo,
+    read_current_decision_projection,
+)
+from src.application.quality.gate import (
+    quality_consumer_telemetry_snapshot,
+    quality_payload_has_lifecycle_rows,
+    record_quality_consumer_read,
 )
 from src.application.quality.intake_checks import build_trade_intake_datasets
-from src.application.quality.ledger_checks import build_ledger_datasets
-from src.application.quality.lifecycle_checks import build_lifecycle_datasets
+from src.application.quality.cutover import (
+    CUTOVER_RECEIPT_SCHEMA,
+    read_quality_hot_path_cutover_receipt,
+)
+from src.application.quality.ledger_checks import (
+    build_current_ledger_dataset,
+    build_ledger_datasets,
+)
+from src.application.quality.lifecycle_checks import (
+    LIFECYCLE_SUMMARY_DATASET_ID,
+    build_current_lifecycle_quality_dataset,
+    build_lifecycle_datasets,
+    build_lifecycle_quality_migration_summary,
+)
 from src.application.trades.lifecycle_reconciliation import (
     build_lifecycle_read_models_from_resolved_account,
 )
@@ -39,6 +58,8 @@ from src.application.quality.position_checks import (
 from src.application.quality.paths import (
     default_quality_artifact_path,
     default_quality_control_path,
+    default_quality_hot_path_cutover_receipt_path,
+    default_quality_integrity_artifact_path,
 )
 from src.application.quality.runtime_checks import build_runtime_checks, runtime_verdict
 from src.application.quality.runtime_status_facade import read_runtime_status
@@ -129,6 +150,88 @@ def _coherent_account_lifecycle_inputs(
     }
 
 
+def _current_lifecycle_position_inputs(
+    current_projection: dict[str, Any],
+) -> dict[str, Any]:
+    if current_projection.get("status") != "trusted":
+        return {
+            "cases": [],
+            "local_lots": [],
+            "read_models_by_case": {},
+            "timing_policies_by_case": {},
+            "coherent": False,
+        }
+    payload = current_projection.get("payload")
+    lifecycle = payload.get("lifecycle") if isinstance(payload, dict) else None
+    facts = (
+        list(lifecycle.get("operational_cases") or [])
+        if isinstance(lifecycle, dict)
+        else []
+    )
+    lots = [
+        dict(item)
+        for item in current_projection.get("position_lots") or []
+        if isinstance(item, dict)
+    ]
+    lots_by_id = {
+        str(item.get("record_id") or "").strip(): item
+        for item in lots
+        if str(item.get("record_id") or "").strip()
+    }
+    cases: list[dict[str, Any]] = []
+    timing: dict[str, dict[str, Any]] = {}
+    for raw in facts:
+        if not isinstance(raw, dict):
+            return {"cases": [], "local_lots": lots, "read_models_by_case": {}, "timing_policies_by_case": {}, "coherent": False}
+        fact = dict(raw)
+        case_id = str(fact.get("case_id") or "").strip()
+        contract = fact.get("contract")
+        fact_timing = fact.get("timing")
+        targets = fact.get("target_contracts_by_lot")
+        if (
+            not case_id
+            or not isinstance(contract, dict)
+            or not isinstance(fact_timing, dict)
+            or not isinstance(targets, dict)
+        ):
+            return {"cases": [], "local_lots": lots, "read_models_by_case": {}, "timing_policies_by_case": {}, "coherent": False}
+        multipliers = {
+            effective_multiplier((lots_by_id.get(str(lot_id)) or {}).get("fields") or {})
+            for lot_id in targets
+        }
+        multipliers.discard(None)
+        if len(multipliers) != 1:
+            return {"cases": [], "local_lots": lots, "read_models_by_case": {}, "timing_policies_by_case": {}, "coherent": False}
+        cases.append(
+            {
+                "case_id": case_id,
+                "account": fact.get("account"),
+                "market": fact.get("market"),
+                "status": fact.get("status"),
+                "symbol": contract.get("symbol"),
+                "option_type": contract.get("option_type"),
+                "position_side": contract.get("position_side"),
+                "strike": contract.get("strike"),
+                "expiration_ymd": contract.get("expiration_ymd"),
+                "multiplier": next(iter(multipliers)),
+            }
+        )
+        timing[case_id] = {
+            "settlement_deadline_ms": fact_timing.get(
+                "settlement_deadline_ms"
+            )
+        }
+    return {
+        "cases": cases,
+        "local_lots": lots,
+        "read_models_by_case": dict(
+            current_projection.get("lifecycle_by_case") or {}
+        ),
+        "timing_policies_by_case": timing,
+        "coherent": True,
+    }
+
+
 class OMQualityService:
     def __init__(
         self,
@@ -140,6 +243,8 @@ class OMQualityService:
         instance_id: str | None = None,
         now_fn: Callable[[], datetime] | None = None,
         ledger_probe_path: str | Path | None = None,
+        integrity_artifact_repository: QualityArtifactRepository | None = None,
+        cutover_receipt_path: str | Path | None = None,
     ) -> None:
         self.artifact_repository = artifact_repository or QualityArtifactRepository(
             default_quality_artifact_path()
@@ -155,13 +260,54 @@ class OMQualityService:
             or "options-monitor-local"
         )
         self.now_fn = now_fn or (lambda: datetime.now(timezone.utc))
+        self.integrity_artifact_repository = (
+            integrity_artifact_repository
+            or QualityArtifactRepository(default_quality_integrity_artifact_path())
+        )
+        self.cutover_receipt_path = Path(
+            cutover_receipt_path
+            or default_quality_hot_path_cutover_receipt_path()
+        ).expanduser()
         self.ledger_probe_path = Path(
             ledger_probe_path
             or default_quality_artifact_path().parent.parent / "option_positions.sqlite3"
         ).expanduser().resolve()
 
-    def read_published(self) -> dict[str, Any] | None:
-        return self.artifact_repository.read()
+    def read_published(
+        self,
+        *,
+        consumer: str | None = None,
+        account: str | None = None,
+        market: str | None = None,
+        lifecycle_rows_requested: bool = False,
+    ) -> dict[str, Any] | None:
+        payload = self.artifact_repository.read()
+        record_quality_consumer_read(
+            consumer=consumer,
+            account=account,
+            market=market,
+            lifecycle_rows_requested=lifecycle_rows_requested,
+            lifecycle_rows_returned=quality_payload_has_lifecycle_rows(
+                payload,
+                account=account,
+                market=market,
+            ),
+        )
+        migration = (
+            ((payload or {}).get("extensions") or {}).get(
+                "current_decision_migration"
+            )
+            if str(consumer or "").strip()
+            else None
+        )
+        if isinstance(migration, dict):
+            migration["quality_consumer_telemetry"] = (
+                quality_consumer_telemetry_snapshot()
+            )
+        return payload
+
+    def read_integrity_published(self) -> dict[str, Any] | None:
+        return self.integrity_artifact_repository.read()
 
     def refresh(
         self,
@@ -170,11 +316,68 @@ class OMQualityService:
         deep: bool = True,
         day_end_strict: bool = False,
     ) -> dict[str, Any]:
+        return self._refresh(
+            config_keys=config_keys,
+            deep=deep,
+            day_end_strict=day_end_strict,
+            force_legacy=False,
+            artifact_repository=self.artifact_repository,
+        )
+
+    def refresh_integrity(
+        self,
+        *,
+        config_keys: list[str] | None = None,
+        deep: bool = True,
+        day_end_strict: bool = False,
+    ) -> dict[str, Any]:
+        return self._refresh(
+            config_keys=config_keys,
+            deep=deep,
+            day_end_strict=day_end_strict,
+            force_legacy=True,
+            artifact_repository=self.integrity_artifact_repository,
+        )
+
+    def _refresh(
+        self,
+        *,
+        config_keys: list[str] | None,
+        deep: bool,
+        day_end_strict: bool,
+        force_legacy: bool,
+        artifact_repository: QualityArtifactRepository,
+    ) -> dict[str, Any]:
         now = self.now_fn().astimezone(timezone.utc)
+        now_ms = int(now.timestamp() * 1000)
         observed_at = utc_iso(now)
-        previous_payload = self._previous_payload()
+        cutover = (
+            {
+                "schema_version": CUTOVER_RECEIPT_SCHEMA,
+                "status": "inactive",
+                "reason": "integrity_refresh",
+            }
+            if force_legacy
+            else read_quality_hot_path_cutover_receipt(
+                self.cutover_receipt_path
+            )
+        )
+        current_only = cutover.get("status") == "active"
+        previous_payload = self._previous_payload(artifact_repository)
         configs = self._load_configs(config_keys or ["us", "hk"])
         requested_markets = {market for _key, _path, _cfg, market in configs}
+        previous_cutover_active = (
+            (((previous_payload or {}).get("extensions") or {}).get("quality_hot_path_cutover") or {}).get("status")
+            == "active"
+        )
+        if (
+            current_only
+            and not previous_cutover_active
+            and requested_markets != {"us", "hk"}
+        ):
+            raise ValueError(
+                "first current-only quality refresh must publish both markets"
+            )
         previous_positions = self._position_dataset_index(previous_payload)
         runtime_statuses: list[dict[str, Any]] = []
         runtime_errors: list[dict[str, str]] = []
@@ -209,6 +412,7 @@ class OMQualityService:
             tuple[Path, str], tuple[dict[str, Any] | None, str | None]
         ] = {}
         authoritative_refresh_scopes: list[dict[str, str]] = []
+        migration_comparisons: list[dict[str, Any]] = []
 
         for key, _path, cfg, market in configs:
             accounts = accounts_from_config(cfg, fallback=())
@@ -234,15 +438,16 @@ class OMQualityService:
                     ledger_path,
                     open_trade_reconciliation_evidence_repo(ledger_path),
                 )
-                datasets.extend(
-                    build_ledger_datasets(
-                        repo=repo,
-                        accounts=accounts,
-                        market=market,
-                        observed_at_utc=observed_at,
+                if not current_only:
+                    datasets.extend(
+                        build_ledger_datasets(
+                            repo=repo,
+                            accounts=accounts,
+                            market=market,
+                            observed_at_utc=observed_at,
+                        )
                     )
-                )
-            else:
+            elif not current_only:
                 datasets.extend(
                     self._unavailable_ledger_datasets(
                         accounts=accounts,
@@ -251,8 +456,16 @@ class OMQualityService:
                     )
                 )
 
-            cases = repo.list_trade_lifecycle_cases() if repo is not None else []
-            evidence_rows = repo.list_trade_lifecycle_evidence() if repo is not None else []
+            cases = (
+                repo.list_trade_lifecycle_cases()
+                if repo is not None and not current_only
+                else []
+            )
+            evidence_rows = (
+                repo.list_trade_lifecycle_evidence()
+                if repo is not None and not current_only
+                else []
+            )
             timing_policies_by_case = (
                 {
                     str(item.get("case_id") or ""): dict(item)
@@ -262,38 +475,81 @@ class OMQualityService:
                     if isinstance(item, dict)
                     and str(item.get("case_id") or "").strip()
                 }
-                if repo is not None
+                if repo is not None and not current_only
                 else {}
             )
-            local_lots = repo.list_position_lots() if repo is not None else []
+            local_lots = (
+                repo.list_position_lots()
+                if repo is not None and not current_only
+                else []
+            )
             calendar_start = self._calendar_start(cases, now=now)
             for account in accounts:
-                account_cases = [
-                    dict(item)
-                    for item in cases
-                    if str(item.get("account") or "").strip().lower()
-                    == account
-                ]
-                account_evidence_rows = [
-                    dict(item)
-                    for item in evidence_rows
-                    if str(item.get("account") or "").strip().lower()
-                    == account
-                ]
-                account_case_ids = {
-                    str(item.get("case_id") or "").strip()
-                    for item in account_cases
-                    if str(item.get("case_id") or "").strip()
+                current_projection: dict[str, Any] = {
+                    "status": "absent",
+                    "reason": "ledger_unavailable",
                 }
-                account_timing_policies_by_case = {
-                    case_id: dict(item)
-                    for case_id, item in timing_policies_by_case.items()
-                    if case_id in account_case_ids
-                }
-                account_local_lots = local_lots
-                account_read_models_by_case: dict[str, dict[str, Any]] = {}
-                lifecycle_coherent_read_available = repo is not None
-                if repo is not None and ledger_path is not None:
+                if current_only:
+                    if repo is not None:
+                        current_projection = read_current_decision_projection(
+                            repo,
+                            account=account,
+                            now_ms=now_ms,
+                        )
+                    datasets.append(
+                        build_current_ledger_dataset(
+                            current_projection=current_projection,
+                            account=account,
+                            market=market,
+                            observed_at_utc=observed_at,
+                        )
+                    )
+                    account_inputs = _current_lifecycle_position_inputs(
+                        current_projection
+                    )
+                    account_cases = list(account_inputs["cases"])
+                    account_evidence_rows: list[dict[str, Any]] = []
+                    account_timing_policies_by_case = dict(
+                        account_inputs["timing_policies_by_case"]
+                    )
+                    account_local_lots = list(account_inputs["local_lots"])
+                    account_read_models_by_case = dict(
+                        account_inputs["read_models_by_case"]
+                    )
+                    lifecycle_coherent_read_available = bool(
+                        account_inputs["coherent"]
+                    )
+                else:
+                    account_cases = [
+                        dict(item)
+                        for item in cases
+                        if str(item.get("account") or "").strip().lower()
+                        == account
+                    ]
+                    account_evidence_rows = [
+                        dict(item)
+                        for item in evidence_rows
+                        if str(item.get("account") or "").strip().lower()
+                        == account
+                    ]
+                    account_case_ids = {
+                        str(item.get("case_id") or "").strip()
+                        for item in account_cases
+                        if str(item.get("case_id") or "").strip()
+                    }
+                    account_timing_policies_by_case = {
+                        case_id: dict(item)
+                        for case_id, item in timing_policies_by_case.items()
+                        if case_id in account_case_ids
+                    }
+                    account_local_lots = local_lots
+                    account_read_models_by_case: dict[str, dict[str, Any]] = {}
+                    lifecycle_coherent_read_available = repo is not None
+                if (
+                    not current_only
+                    and repo is not None
+                    and ledger_path is not None
+                ):
                     cache_key = (ledger_path, account)
                     if cache_key not in lifecycle_account_cache:
                         try:
@@ -301,7 +557,7 @@ class OMQualityService:
                                 _coherent_account_lifecycle_inputs(
                                     repo,
                                     account=account,
-                                    now_ms=int(now.timestamp() * 1000),
+                                    now_ms=now_ms,
                                 ),
                                 None,
                             )
@@ -430,24 +686,118 @@ class OMQualityService:
                         market=market,
                     )
                 datasets.append(position_dataset)
-                datasets.extend(
-                    build_lifecycle_datasets(
-                        cases=account_cases,
-                        evidence_rows=account_evidence_rows,
-                        account=account,
-                        market=market,
-                        observed_at_utc=observed_at,
-                        now=now,
-                        trading_days=trading_days,
-                        first_deep_by_case=dict(
-                            control_state.get("lifecycle_first_deep_reconcile") or {}
-                        ),
-                        timing_policies_by_case=(
-                            account_timing_policies_by_case
-                        ),
-                        read_models_by_case=account_read_models_by_case,
+                if current_only:
+                    datasets.append(
+                        build_current_lifecycle_quality_dataset(
+                            current_quality=dict(
+                                current_projection.get("lifecycle_quality") or {}
+                            ),
+                            projection_status=str(
+                                current_projection.get("status") or "absent"
+                            ),
+                            projection_reason=str(
+                                current_projection.get("reason") or ""
+                            )
+                            or None,
+                            account=account,
+                            market=market,
+                            observed_at_utc=observed_at,
+                        )
                     )
+                    migration_comparisons.append(
+                        {
+                            "account": account,
+                            "market": market,
+                            "status": "cutover_active",
+                            "current_projection_status": str(
+                                current_projection.get("status") or "absent"
+                            ),
+                        }
+                    )
+                    datasets.append(
+                        self._holdings_sync_dataset(
+                            runtime_for_config=runtime_for_config,
+                            account=account,
+                            market=market,
+                            observed_at=observed_at,
+                        )
+                    )
+                    continue
+                legacy_lifecycle_datasets = build_lifecycle_datasets(
+                    cases=account_cases,
+                    evidence_rows=account_evidence_rows,
+                    account=account,
+                    market=market,
+                    observed_at_utc=observed_at,
+                    now=now,
+                    trading_days=trading_days,
+                    first_deep_by_case=dict(
+                        control_state.get("lifecycle_first_deep_reconcile")
+                        or {}
+                    ),
+                    timing_policies_by_case=(
+                        account_timing_policies_by_case
+                    ),
+                    read_models_by_case=account_read_models_by_case,
                 )
+                datasets.extend(legacy_lifecycle_datasets)
+                migration = {
+                    "account": account,
+                    "market": market,
+                    "status": "not_available",
+                    "current_projection_status": "absent",
+                }
+                if repo is not None:
+                    try:
+                        current_projection = read_current_decision_projection(
+                            repo,
+                            account=account,
+                            now_ms=now_ms,
+                        )
+                        migration["current_projection_status"] = str(
+                            current_projection.get("status")
+                            or "data_unavailable"
+                        )
+                        if current_projection.get("status") == "trusted":
+                            summary_dataset, comparison = (
+                                build_lifecycle_quality_migration_summary(
+                                    legacy_datasets=legacy_lifecycle_datasets,
+                                    current_quality=dict(
+                                        current_projection.get(
+                                            "lifecycle_quality"
+                                        )
+                                        or {}
+                                    ),
+                                    account=account,
+                                    market=market,
+                                    observed_at_utc=observed_at,
+                                    now_ms=now_ms,
+                                    case_status_by_id={
+                                        str(item.get("case_id") or "").strip(): str(
+                                            item.get("status") or ""
+                                        ).strip().lower()
+                                        for item in account_cases
+                                        if str(item.get("case_id") or "").strip()
+                                    },
+                                    read_models_by_case=(
+                                        account_read_models_by_case
+                                    ),
+                                )
+                            )
+                            datasets.append(summary_dataset)
+                            migration.update(
+                                status=comparison["status"],
+                                comparison=comparison,
+                            )
+                    except Exception as exc:
+                        migration.update(
+                            status="error",
+                            reason=(
+                                "quality_shadow_failed:"
+                                f"{type(exc).__name__}"
+                            ),
+                        )
+                migration_comparisons.append(migration)
                 datasets.append(
                     self._holdings_sync_dataset(
                         runtime_for_config=runtime_for_config,
@@ -462,6 +812,7 @@ class OMQualityService:
             requested_markets=requested_markets,
             datasets=datasets,
             runtime_checks=runtime_checks,
+            current_only=current_only,
         )
         control_state["updated_at_utc"] = observed_at
         control_state["last_probe_ledger_revision"] = self._ledger_revision()
@@ -469,6 +820,39 @@ class OMQualityService:
         runtime_status = runtime_verdict(runtime_checks)
         if runtime_errors and runtime_status == "healthy":
             runtime_status = "unknown"
+        published_datasets = self._deduplicate_datasets(datasets)
+        telemetry = quality_consumer_telemetry_snapshot()
+        declared_lifecycle_read = any(
+            item["legacy_rows_requested"]
+            and item["consumer"] != "unexplained"
+            for item in telemetry["entries"]
+        )
+        published_scopes = {
+            (
+                str((item.get("scope") or {}).get("account") or "").lower(),
+                str((item.get("scope") or {}).get("market") or "").lower(),
+            )
+            for item in published_datasets
+            if (item.get("scope") or {}).get("account")
+            and (item.get("scope") or {}).get("market")
+        }
+        matched_scopes = {
+            (str(item["account"]), str(item["market"]))
+            for item in migration_comparisons
+            if item["status"] == "matched"
+        }
+        migration_ready = (
+            not current_only
+            and
+            bool(migration_comparisons)
+            and all(
+                item["status"] == "matched"
+                for item in migration_comparisons
+            )
+            and published_scopes <= matched_scopes
+            and telemetry["coverage_status"] == "observed"
+            and declared_lifecycle_read
+        )
         payload: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "producer": {
@@ -490,7 +874,7 @@ class OMQualityService:
                 "checks": runtime_checks,
                 "extensions": {"runtime_status_errors": runtime_errors},
             },
-            "datasets": self._deduplicate_datasets(datasets),
+            "datasets": published_datasets,
             "incidents": [],
             "extensions": {
                 "onboarded": self._onboarded(),
@@ -498,11 +882,36 @@ class OMQualityService:
                 "deep_refresh_requested": deep,
                 "day_end_strict": day_end_strict,
                 "authoritative_refresh_scopes": authoritative_refresh_scopes,
+                "quality_hot_path_cutover": cutover,
+                "integrity_refresh": force_legacy,
+                "current_decision_migration": {
+                    "schema_version": "current_decision_migration.v1",
+                    "status": (
+                        "cutover_active"
+                        if current_only
+                        else "shadow_ready"
+                        if migration_ready
+                        else "not_ready"
+                    ),
+                    "comparisons": migration_comparisons,
+                    "quality_consumer_telemetry": telemetry,
+                },
             },
         }
-        payload["summary"] = summarize(payload)
+        payload["summary"] = summarize(
+            {
+                **payload,
+                "datasets": [
+                    item
+                    for item in published_datasets
+                    if current_only
+                    or item.get("dataset_id")
+                    != LIFECYCLE_SUMMARY_DATASET_ID
+                ],
+            }
+        )
         validate_payload(payload, schema_path=_SCHEMA)
-        self.artifact_repository.write_atomic(payload)
+        artifact_repository.write_atomic(payload)
         return payload
 
     def refresh_if_due(
@@ -539,8 +948,11 @@ class OMQualityService:
             day_end_strict=False,
         )
 
-    def _previous_payload(self) -> dict[str, Any] | None:
-        payload = self.artifact_repository.read()
+    @staticmethod
+    def _previous_payload(
+        artifact_repository: QualityArtifactRepository,
+    ) -> dict[str, Any] | None:
+        payload = artifact_repository.read()
         producer = payload.get("producer") if isinstance(payload, dict) else None
         if (
             not isinstance(payload, dict)
@@ -808,11 +1220,17 @@ class OMQualityService:
         requested_markets: set[str],
         datasets: list[dict[str, Any]],
         runtime_checks: list[dict[str, Any]],
+        current_only: bool = False,
     ) -> None:
         if previous_payload is None:
             return
         for item in previous_payload.get("datasets") or []:
             if not isinstance(item, dict):
+                continue
+            if current_only and item.get("dataset_id") in {
+                "om.lifecycle_evidence",
+                "om.lifecycle_history",
+            }:
                 continue
             scope = item.get("scope") if isinstance(item.get("scope"), dict) else {}
             market = str(scope.get("market") or "").strip().lower()

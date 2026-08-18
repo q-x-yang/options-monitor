@@ -11,12 +11,14 @@ from domain.domain.decision_state_fingerprint import canonical_sha256
 from domain.domain.ledger.position_fields import normalize_account, normalize_broker
 from domain.domain.portfolio_scope import portfolio_scope_id
 from domain.services import adapt_option_positions_context
-from src.application.exchange_rate_loader import (
-    fetch_opend_exchange_rate_observation,
+from src.infrastructure.exchange_rates import (
+    exchange_rate_observation_status,
+    get_exchange_rates_or_fetch_latest,
 )
 from src.application.ledger.api import (
     decision_state_snapshot_from_rows,
     open_position_ledger_from_data_config,
+    read_current_decision_projection,
     read_decision_state_rows_many,
     resolve_position_data_config_path,
     resolve_position_ledger_sqlite_path,
@@ -130,6 +132,7 @@ def prepare_option_positions_contexts(
         data_config_by_ledger_path.setdefault(ledger_path, data_path)
 
     rows_by_ledger_path: dict[Path, dict[str, dict[str, Any]]] = {}
+    repos_by_ledger_path: dict[Path, Any] = {}
     ledger_read_count = 0
     for ledger_path, accounts in sorted(
         accounts_by_ledger_path.items(),
@@ -144,6 +147,7 @@ def prepare_option_positions_contexts(
                 repo,
                 accounts=tuple(sorted(accounts)),
             )
+            repos_by_ledger_path[ledger_path] = repo
             ledger_read_count += 1
         except Exception as exc:
             reason = f"coherent_position_ledger_unavailable:{type(exc).__name__}"
@@ -158,8 +162,13 @@ def prepare_option_positions_contexts(
     fx_status = "unavailable"
     fx_error_type: str | None = None
     try:
-        candidate = fetch_opend_exchange_rate_observation(
-            (account, configs[account]) for account in sorted(configs)
+        rate_cache_path = (
+            base_path / "output_shared" / "state" / "rate_cache.json"
+        ).resolve()
+        candidate = get_exchange_rates_or_fetch_latest(
+            cache_path=rate_cache_path,
+            max_age_hours=24,
+            log=log,
         )
         fx_observation = (
             dict(candidate) if isinstance(candidate, Mapping) else None
@@ -214,15 +223,30 @@ def prepare_option_positions_contexts(
             records = list(
                 generation_payloads[accounts[0]]["stored_position_lots"]
             )
-            snapshots = {
-                account: decision_state_snapshot_from_rows(
+            snapshots = {}
+            for account in accounts:
+                try:
+                    current_projection = read_current_decision_projection(
+                        repos_by_ledger_path[ledger_path],
+                        account=account,
+                        now_ms=lifecycle_now_ms,
+                    )
+                except Exception as exc:
+                    current_projection = {
+                        "status": "data_unavailable",
+                        "reason": (
+                            "current_projection_read_failed:"
+                            f"{type(exc).__name__}"
+                        ),
+                    }
+                snapshots[account] = decision_state_snapshot_from_rows(
                     rows_by_account[account],
                     account=account,
                     portfolio_scope_id=portfolio_scope_id(account),
                     source_observed_at=observed_at_utc,
+                    current_projection=current_projection,
+                    current_decision_now_ms=lifecycle_now_ms,
                 )
-                for account in accounts
-            }
         except Exception as exc:
             reason = f"coherent_position_projection_unavailable:{type(exc).__name__}"
             for account in accounts:
@@ -282,6 +306,9 @@ def prepare_option_positions_contexts(
                 context["decision_state_snapshot"] = dict(
                     snapshots[account]
                 )
+                context["current_decision_shadow"] = dict(
+                    snapshots[account]["current_decision_shadow"]
+                )
                 context["context_source"] = "prepared"
                 context["prepared_authority"] = prepared_authority
                 try:
@@ -289,6 +316,10 @@ def prepare_option_positions_contexts(
                         context,
                         expected_account=account,
                         expected_broker=broker,
+                    )
+                    application_received_at_utc = datetime.now(timezone.utc).isoformat()
+                    prepared_authority["application_received_at_utc"] = (
+                        application_received_at_utc
                     )
                     manifest = _publish_ready_context(
                         base=base_path,
@@ -304,6 +335,7 @@ def prepare_option_positions_contexts(
                             or ""
                         ),
                         source_observed_at=observed_at_utc,
+                        application_received_at_utc=(application_received_at_utc),
                         fx_status=fx_status,
                         fx_observation_sha256=fx_observation_sha256,
                         fx_error_type=fx_error_type,
@@ -344,7 +376,7 @@ def prepare_option_positions_contexts(
     )
 
 
-def load_prepared_option_positions_context(
+def _load_prepared_option_positions_context_artifacts(
     *,
     manifest_path: Path,
     expected_base: Path,
@@ -524,7 +556,71 @@ def load_prepared_option_positions_context(
         raise PreparedOptionPositionsContextError(
             "prepared option decision snapshot fingerprint mismatch"
         )
-    return payload
+    return {
+        "manifest": manifest,
+        "payload": payload,
+        "manifest_bytes": manifest_bytes,
+        "payload_bytes": payload_bytes,
+    }
+
+
+def load_prepared_option_positions_context_receipt(
+    *,
+    manifest_path: Path,
+    expected_base: Path,
+    expected_run_id: str,
+    expected_account: str,
+    expected_account_config_sha256: str,
+    expected_manifest_sha256: str | None = None,
+    expected_runtime_config: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Load bytes and expose only the owner-validated application receipt."""
+
+    receipt = _load_prepared_option_positions_context_artifacts(
+        manifest_path=manifest_path,
+        expected_base=expected_base,
+        expected_run_id=expected_run_id,
+        expected_account=expected_account,
+        expected_account_config_sha256=expected_account_config_sha256,
+        expected_manifest_sha256=expected_manifest_sha256,
+        expected_runtime_config=expected_runtime_config,
+    )
+    manifest = receipt["manifest"]
+    prepared = receipt["payload"]["prepared_authority"]
+    application_received_at_utc = _utc_application_receipt(
+        manifest.get("application_received_at_utc")
+    )
+    if (
+        str(prepared.get("application_received_at_utc") or "")
+        != application_received_at_utc
+    ):
+        raise PreparedOptionPositionsContextError(
+            "prepared option payload authority mismatch: application_received_at_utc"
+        )
+    return receipt
+
+
+def load_prepared_option_positions_context(
+    *,
+    manifest_path: Path,
+    expected_base: Path,
+    expected_run_id: str,
+    expected_account: str,
+    expected_account_config_sha256: str,
+    expected_manifest_sha256: str | None = None,
+    expected_runtime_config: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Load the existing payload-only facade from a validated receipt."""
+
+    return _load_prepared_option_positions_context_artifacts(
+        manifest_path=manifest_path,
+        expected_base=expected_base,
+        expected_run_id=expected_run_id,
+        expected_account=expected_account,
+        expected_account_config_sha256=expected_account_config_sha256,
+        expected_manifest_sha256=expected_manifest_sha256,
+        expected_runtime_config=expected_runtime_config,
+    )["payload"]
 
 
 def exchange_rate_scalars_from_option_context(
@@ -578,6 +674,7 @@ def _publish_ready_context(
     ledger_generation_sha256: str,
     decision_state_fingerprint: str,
     source_observed_at: str,
+    application_received_at_utc: str,
     fx_status: str,
     fx_observation_sha256: str,
     fx_error_type: str | None,
@@ -601,6 +698,7 @@ def _publish_ready_context(
         "ledger_generation_sha256": ledger_generation_sha256,
         "decision_state_fingerprint": decision_state_fingerprint,
         "source_observed_at": source_observed_at,
+        "application_received_at_utc": application_received_at_utc,
         "fx_status": fx_status,
         "fx_observation_sha256": fx_observation_sha256,
     }
@@ -626,6 +724,7 @@ def _publish_unavailable_manifest(
     fx_observation_sha256: str,
     fx_error_type: str | None,
 ) -> dict[str, Any]:
+    application_received_at_utc = datetime.now(timezone.utc).isoformat()
     manifest: dict[str, Any] = {
         "schema_version": PREPARED_OPTION_POSITIONS_CONTEXT_SCHEMA,
         "run_id": run_id,
@@ -634,6 +733,7 @@ def _publish_unavailable_manifest(
         "reason": str(reason),
         "account_config_sha256": account_config_sha256,
         "source_observed_at": source_observed_at,
+        "application_received_at_utc": application_received_at_utc,
         "fx_status": fx_status,
         "fx_observation_sha256": fx_observation_sha256,
     }
@@ -745,6 +845,21 @@ def _required_sha256(value: Any, field: str) -> str:
     return digest
 
 
+def _utc_application_receipt(value: Any) -> str:
+    text = _required_text(value, "application_received_at_utc")
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise PreparedOptionPositionsContextError(
+            "application_received_at_utc is invalid"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
+        raise PreparedOptionPositionsContextError(
+            "application_received_at_utc must be UTC"
+        )
+    return text
+
+
 def _positive_float(value: Any) -> float | None:
     try:
         parsed = float(value)
@@ -762,5 +877,6 @@ __all__ = [
     "cny_per_currency_rates_from_option_context",
     "exchange_rate_scalars_from_option_context",
     "load_prepared_option_positions_context",
+    "load_prepared_option_positions_context_receipt",
     "prepare_option_positions_contexts",
 ]

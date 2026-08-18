@@ -30,7 +30,10 @@ VALIDATION_FILL_CONTRACT_VERSION = "scheduled_point_first_observed_cross.v1"
 VALIDATION_METRIC_CONTRACT_VERSION = "sell_put_top1_paired_daily_efficiency.v1"
 EXPIRY_OUTCOME_CONTRACT_VERSION = "expiry_outcome_at_underlier_close.v1"
 SEALED_HISTORICAL_DATASET_SCHEMA = "sealed_historical_dataset.v1"
+HISTORICAL_RESEARCH_WINDOW_SCHEMA = "historical_research_window.v1"
 RECOMMENDATION_POINT_SELECTOR = "official_scheduled_sell_put.v1"
+RESEARCH_REQUIRED_DAYS = 20
+VALIDATION_REQUIRED_DAYS = 10
 
 _HASH_64 = re.compile(r"[0-9a-f]{64}\Z")
 _BEHAVIOR_KEYS = frozenset(
@@ -308,7 +311,9 @@ def _validate_research_source(value: object) -> None:
         ),
         "research_source",
     )
-    _fixed(item["mode"], "sealed_historical_dataset", "research_source.mode")
+    mode = _text(item["mode"], "research_source.mode")
+    if mode not in {"sealed_historical_dataset", "historical_research_window"}:
+        _fail("research_source.mode is unsupported")
     _ = _relative_posix_path(item["dataset_ref"], "research_source.dataset_ref")
     _ = _sha256(item["dataset_sha256"], "research_source.dataset_sha256")
     _ = _utc_timestamp(item["research_cutoff_at"], "research_source.research_cutoff_at")
@@ -345,7 +350,11 @@ def _validate_research_evaluation(value: object) -> None:
         "research_evaluation.metric_contract_version",
     )
     _fixed(item["fill_assumption"], "t0_sell_limit", "research_evaluation.fill_assumption")
-    _fixed(item["required_days"], 40, "research_evaluation.required_days")
+    _fixed(
+        item["required_days"],
+        RESEARCH_REQUIRED_DAYS,
+        "research_evaluation.required_days",
+    )
     _fixed(
         item["window_mode"],
         "fixed_consecutive_trading_days",
@@ -465,7 +474,11 @@ def _validate_validation_fields(spec: Mapping[str, object]) -> None:
         frozenset({"required_days", "window_mode", "visibility"}),
         "validation_evaluation",
     )
-    _fixed(evaluation["required_days"], 20, "validation_evaluation.required_days")
+    _fixed(
+        evaluation["required_days"],
+        VALIDATION_REQUIRED_DAYS,
+        "validation_evaluation.required_days",
+    )
     _fixed(
         evaluation["window_mode"],
         "fixed_future_consecutive_trading_days",

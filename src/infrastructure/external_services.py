@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from src.infrastructure.opend_watchdog import run_watchdog_check
+from src.infrastructure.opend_watchdog import port_open, run_watchdog_check
 
 
 def run_command(
@@ -288,6 +288,11 @@ def trading_day_via_futu(
     try:
         from futu import OpenQuoteContext
     except Exception:
+        return (None, market_used)
+
+    # 等价于 FutuGatewayUnreachableError: 调用方按既有契约以 (None, market)
+    # 表示外部依赖不可用，不阻断主流程。
+    if not port_open(str(host), int(port)):
         return (None, market_used)
 
     try:

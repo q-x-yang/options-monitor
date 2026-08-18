@@ -17,6 +17,7 @@ from src.application.scan_scheduler import scheduled_scan_targets_for_date
 from src.application.shadow_replay.common import artifact_content_sha256, render_json_text
 from src.application.strategy_lab.top1.contracts import (
     Top1CoreContractError,
+    VALIDATION_REQUIRED_DAYS,
     build_current_behavior_binding,
     build_research_spec_sha256,
     build_validation_spec_sha256,
@@ -132,8 +133,11 @@ def _timestamp(value: object, label: str = "occurred_at_utc") -> str:
 
 
 def _trading_dates(values: Sequence[object]) -> list[str]:
-    if isinstance(values, (str, bytes)) or len(values) != 20:
-        _fail("experiment_invalid", "hidden commitment must contain exactly 20 dates")
+    if isinstance(values, (str, bytes)) or len(values) != VALIDATION_REQUIRED_DAYS:
+        _fail(
+            "experiment_invalid",
+            f"hidden commitment must contain exactly {VALIDATION_REQUIRED_DAYS} dates",
+        )
     parsed: list[date] = []
     texts: list[str] = []
     for index, value in enumerate(values):
@@ -584,7 +588,7 @@ def seal_generation(
     if generation_kind != "research":
         _fail(
             "experiment_invalid",
-            "W3 seal_generation only accepts research; hidden seals at day 20",
+            f"W3 seal_generation only accepts research; hidden seals at day {VALIDATION_REQUIRED_DAYS}",
         )
     actor, occurred_at_utc, idempotency_key = _command_fields(
         actor, occurred_at_utc, idempotency_key
@@ -658,13 +662,44 @@ def build_hidden_window_commitment(
     ]
     if calendar_dates != sorted(set(calendar_dates)):
         _fail("experiment_invalid", "market calendar trading dates are invalid")
+    raw_sessions = market_calendar_binding.get("trading_sessions")
+    if not isinstance(raw_sessions, list):
+        _fail("experiment_invalid", "market calendar trading sessions are missing")
+    session_dates: list[str] = []
+    session_types: list[str] = []
+    for index, raw_session in enumerate(raw_sessions):
+        if not isinstance(raw_session, Mapping) or set(raw_session) != {
+            "trading_date",
+            "trade_date_type",
+        }:
+            _fail("experiment_invalid", "market calendar trading sessions are invalid")
+        session_dates.append(
+            _iso_date(
+                raw_session["trading_date"],
+                f"market_calendar_binding.trading_sessions[{index}].trading_date",
+            )
+        )
+        session_types.append(
+            _text(
+                raw_session["trade_date_type"],
+                f"market_calendar_binding.trading_sessions[{index}].trade_date_type",
+            )
+        )
+    if session_dates != calendar_dates or any(
+        value not in {"WHOLE", "MORNING", "AFTERNOON"} for value in session_types
+    ):
+        _fail("experiment_invalid", "market calendar trading sessions are invalid")
+    session_by_date = dict(zip(session_dates, session_types, strict=True))
     try:
         start_index = calendar_dates.index(start)
     except ValueError:
         _fail("experiment_invalid", "validation start is not a trading date")
-    dates = calendar_dates[start_index : start_index + 20]
-    if len(dates) != 20:
-        _fail("experiment_invalid", "market calendar does not cover 20 trading days")
+    dates = calendar_dates[start_index : start_index + VALIDATION_REQUIRED_DAYS]
+    if len(dates) != VALIDATION_REQUIRED_DAYS:
+        _fail(
+            "experiment_invalid",
+            f"market calendar does not cover {VALIDATION_REQUIRED_DAYS} trading days",
+        )
     if not isinstance(schedule, Mapping) or schedule.get("timezone") != (
         "Asia/Hong_Kong"
     ):
@@ -676,7 +711,11 @@ def build_hidden_window_commitment(
         try:
             targets = [
                 target.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-                for target in scheduled_scan_targets_for_date(schedule_payload, day)
+                for target in scheduled_scan_targets_for_date(
+                    schedule_payload,
+                    day,
+                    trade_date_type=session_by_date[day],
+                )
             ]
         except (TypeError, ValueError) as exc:
             raise Top1LifecycleError(
@@ -795,8 +834,11 @@ def validate_hidden_window_commitment(
     )
     _hash(item["schedule_config_sha256"], "schedule_config_sha256")
     raw_days = item["days"]
-    if not isinstance(raw_days, list) or len(raw_days) != 20:
-        _fail("experiment_conflict", "hidden commitment must contain 20 day entries")
+    if not isinstance(raw_days, list) or len(raw_days) != VALIDATION_REQUIRED_DAYS:
+        _fail(
+            "experiment_conflict",
+            f"hidden commitment must contain {VALIDATION_REQUIRED_DAYS} day entries",
+        )
     days: list[dict[str, object]] = []
     for index, raw_day in enumerate(raw_days):
         if not isinstance(raw_day, Mapping) or set(raw_day) != _HIDDEN_DAY_FIELDS:
@@ -1064,7 +1106,9 @@ def _validate_commitment_calendar(
         start_index = calendar_dates.index(start)
     except ValueError:
         _fail("experiment_conflict", "committed start is absent from calendar")
-    if calendar_dates[start_index : start_index + 20] != commitment["trading_dates"]:
+    if calendar_dates[
+        start_index : start_index + VALIDATION_REQUIRED_DAYS
+    ] != commitment["trading_dates"]:
         _fail("experiment_conflict", "committed dates are not consecutive")
     return binding
 

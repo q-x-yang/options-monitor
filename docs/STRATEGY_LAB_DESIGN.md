@@ -698,9 +698,30 @@ config 解析；多 Futu 账户不允许依赖列表顺序或默认端口推断�
 ### 实验功能：Sell Put Top1 loop
 
 Top1 loop 是独立的实验功能，固定绑定 `HK/lx`，默认不渲染、不运行；维护方可随时
-移除 service render opt-in 或关闭 maintainer availability。它只组合已经存在的
-语料、研究、20 个交易日隐藏验证和终态回执命令，不改交易策略配置，也不自动采用
+移除 service render opt-in 或关闭 maintainer availability。它只组合已经存在的正式语料、
+20 个交易日研究回跑、10 个交易日隐藏验证和终态回执命令，不改交易策略配置，也不自动采用
 胜者。
+
+正式样本点与生产扫描调度使用同一个 `scheduled_scan_target_market`。`HK/lx`
+完整交易日当前事前封存 12 个点：
+
+- 固定报告点：`09:40`、`10:00`、`11:00`、`13:00`、`14:00`、`15:00`、`15:50`；
+- 候选检查点：`10:30`、`11:30`、`13:30`、`14:30`、`15:30`。
+
+两类点都运行同一个完整候选扫描，因此都可进入实验；候选检查点不要求实际发送
+通知。每个点必须在当日 expectation 中事前封存，并具有完整的 official
+recommendation point、opening snapshot 和 ranking projection。任一预期点缺失、冲突或
+不可评估，整个交易日不进入样本，不另设“够多就算”的临时阈值。半日市按 HK
+交易日历封存实际时段内的预期点。
+
+评价先计算同点 baseline/challenger 的 paired delta，再对同一账户、同一交易日的
+有效点取日均。统计样本量按交易日计，不把一天 12 个点当成 12 个独立日。
+
+已有 Strategy Lab / Shadow Replay 快照可作为提出假设的探索性证据。W0 只把正式研究语料窗口
+从 40 日调整为 20 日，不新增历史归档转换或 OpenD 补数能力；只有能证明精确调度点、事前封存
+分母及完整排名和结果证据的数据，才能进入当前正式研究语料。旧归档桥接属于后续独立模块，
+不得为了补数量把旧快照默认迁移成正式样本。未来 10 日隐藏验证继续要求事前封存调度点和完整
+分母。
 
 只读入口：
 
@@ -709,6 +730,39 @@ Top1 loop 是独立的实验功能，固定绑定 `HK/lx`，默认不渲染、�
 ./om research strategy-lab top1-loop status --market hk --account lx --profile-path <runtime>/service.profile.json --experiment-id <id>
 ./om research strategy-lab top1-loop readiness --market hk --account lx --profile-path <runtime>/service.profile.json
 ```
+
+HK 交易日历证据由操作员显式刷新，不随 loop 自动运行：
+
+```bash
+./om research strategy-lab top1-loop calendar refresh --market hk --account lx --profile-path <runtime>/service.profile.json --coverage-start <YYYY-MM-DD> --coverage-end <YYYY-MM-DD> --calendar-version <version> --write
+```
+
+该命令使用 profile 已绑定的 OpenD，只落内容寻址的紧凑日历快照和 `current`
+指针；快照保留每个交易日的 `WHOLE/MORNING/AFTERNOON` 时段类型，原始响应不落盘，
+只保留规范化来源回执哈希。相同证据重复刷新不会新增文件。
+它只关闭 calendar blocker，不代表其余 W0R capability 已就绪。
+
+其余 W0R 回执由操作员显式刷新，不由 readiness 或 timer 自动探测：
+
+```bash
+./om research strategy-lab top1-loop capabilities refresh \
+  --market hk --account lx --profile-path <runtime>/service.profile.json \
+  --fee-plan-receipt-path <account-fee-plan-receipt.json> \
+  --stock-owner HK.00700 --contract-symbol <HK-put-contract> \
+  --terms-expiration <YYYY-MM-DD> --close-expiration <YYYY-MM-DD> --write
+```
+
+费用套餐输入固定为 `sell_put_top1_account_fee_plan_receipt.v1`，必须包含
+`HK/lx`、`commission_free`、`platform_fee`、`fee_plan_ref`、观察时间，以及原始人工
+证据的 ref/SHA-256；普通 event、position 或 CLI 标量不能代替这份回执。命令复用
+现有 gateway，依次验证 quote、exact-expiration terms、history K-Line quota 和
+exact-expiration close，只把规范化标量与来源 hash 写入
+`strategy_lab/top1/capabilities/w0r/hk/lx/current.json`。该文件最多 8 KiB，每次成功
+刷新原子替换，不保存 raw snapshot、option chain、quota detail 或历史回执序列。
+
+readiness 只读并严格校验该文件；文件缺失、篡改、OpenD host/port 漂移或任一子回执
+无效时，五项 capability fact 全部保持 false。真实预检调用与刷新写入仍需要单独的
+操作授权。该回执只证明最近一次显式预检通过，不替代实验执行时的 gateway 与配额检查。
 
 定时 source delivery 必须显式提供 cadence、timeout 和 env file：
 

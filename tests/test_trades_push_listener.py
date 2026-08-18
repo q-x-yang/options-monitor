@@ -5,7 +5,19 @@ import sys
 import threading
 from types import SimpleNamespace
 
+import pytest
+
 from src.application.trades.push_listener import OpenDTradePushListener
+
+
+@pytest.fixture(autouse=True)
+def _open_port(monkeypatch):
+    """Tests mock the futu SDK; keep the port pre-check passing."""
+
+    from src.application.trades import push_listener as mod
+
+    monkeypatch.setattr(mod, "port_open", lambda host, port: True)
+    yield
 
 
 def test_trade_push_listener_isolates_callback_exception(monkeypatch) -> None:
@@ -259,3 +271,14 @@ def test_trade_push_listener_constructor_error_removes_handler(monkeypatch) -> N
         raise AssertionError("expected retryable constructor failure")
 
     assert list(sdk_logger.handlers) == handlers_before
+
+
+def test_listener_raises_typed_unreachable_when_port_closed(monkeypatch) -> None:
+    from src.application.trades import push_listener as mod
+    from src.infrastructure.futu_gateway import FutuGatewayUnreachableError
+
+    monkeypatch.setattr(mod, "port_open", lambda host, port: False)
+
+    listener = OpenDTradePushListener(host="127.0.0.9", port=11119, on_deal=lambda payload: None)
+    with pytest.raises(FutuGatewayUnreachableError):
+        listener._build_default_context()

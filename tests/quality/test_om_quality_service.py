@@ -4,9 +4,11 @@ import json
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+import pytest
 from jsonschema import Draft202012Validator, FormatChecker
 
 import src.application.quality.service as service_module
+from domain.domain.decision_state_fingerprint import canonical_sha256
 from domain.domain.option_lifecycle import build_lifecycle_case
 from src.application.ledger.repository import SQLiteOptionPositionsRepository
 from src.application.ledger.position_records import PositionLotRecord
@@ -37,6 +39,34 @@ class _OpenD:
             rows=[],
             trading_days=[date(2026, 7, 13), date(2026, 7, 14)],
         )
+
+
+def _empty_current_quality() -> dict:
+    return {
+        "schema_version": "current_lifecycle_quality.v1",
+        "account": "lx",
+        "aggregate_by_market": [],
+        "operational_cases": [],
+        "aggregate_fingerprint": canonical_sha256([]),
+        "detail_fingerprint": canonical_sha256([]),
+        "operational_status_counts": {},
+        "blocked_consumer_counts": {},
+    }
+
+
+def _trusted_empty_current_projection() -> dict:
+    return {
+        "status": "trusted",
+        "reason": None,
+        "payload": {
+            "position_binding": {},
+            "lifecycle": {"operational_cases": []},
+        },
+        "position_lots": [],
+        "lot_count": 0,
+        "lifecycle_by_case": {},
+        "lifecycle_quality": _empty_current_quality(),
+    }
 
 
 def test_holdings_sync_quality_treats_no_activity_as_not_triggered() -> None:
@@ -147,6 +177,34 @@ def test_service_publishes_schema_valid_artifact_without_business_writes(
     }
     monkeypatch.setattr(service_module, "load_runtime_config", lambda **_kwargs: (config_path, cfg))
     monkeypatch.setattr(service_module, "infer_runtime_config_market", lambda **_kwargs: "US")
+    current_reads: list[str] = []
+
+    def _current_projection(_repo, *, account: str, now_ms: int) -> dict:
+        assert now_ms > 0
+        current_reads.append(account)
+        return {
+            "status": "trusted",
+            "lifecycle_quality": _empty_current_quality(),
+        }
+
+    monkeypatch.setattr(
+        service_module,
+        "read_current_decision_projection",
+        _current_projection,
+    )
+    monkeypatch.setattr(
+        service_module,
+        "quality_consumer_telemetry_snapshot",
+        lambda: {
+            "coverage_status": "unexplained",
+            "entries": [
+                {
+                    "consumer": "unexplained",
+                    "legacy_rows_requested": True,
+                }
+            ],
+        },
+    )
     now = datetime(2026, 7, 13, 10, tzinfo=timezone.utc)
     runtime = {
         "config": {"config_key": "us"},
@@ -202,6 +260,22 @@ def test_service_publishes_schema_valid_artifact_without_business_writes(
     } <= check_ids
     runtime_ids = {item["check_id"] for item in payload["runtime"]["checks"]}
     assert {"RT-OM-001", "RT-OM-002", "RT-OM-003", "RT-OM-004"} <= runtime_ids
+    lifecycle_summary = next(
+        item
+        for item in payload["datasets"]
+        if item["dataset_id"] == "om.lifecycle_evidence_summary"
+    )
+    assert current_reads == ["lx"]
+    assert lifecycle_summary["status"] == "trusted"
+    assert lifecycle_summary["extensions"]["comparison"]["status"] == "matched"
+    assert payload["extensions"]["current_decision_migration"]["status"] == "not_ready"
+    assert sum(payload["summary"]["dataset_counts"].values()) == len(
+        [
+            item
+            for item in payload["datasets"]
+            if item["dataset_id"] != "om.lifecycle_evidence_summary"
+        ]
+    )
 
     schema = json.loads(
         (Path(__file__).resolve().parents[2] / "contracts/quality-monitoring/quality_status.v1.schema.json").read_text(
@@ -512,6 +586,27 @@ def test_single_market_day_end_refresh_preserves_other_market(
         "infer_runtime_config_market",
         lambda *, config_path, **_kwargs: config_path.stem.split(".")[-1],
     )
+    monkeypatch.setattr(
+        service_module,
+        "read_current_decision_projection",
+        lambda *_args, **_kwargs: {
+            "status": "trusted",
+            "lifecycle_quality": _empty_current_quality(),
+        },
+    )
+    monkeypatch.setattr(
+        service_module,
+        "quality_consumer_telemetry_snapshot",
+        lambda: {
+            "coverage_status": "observed",
+            "entries": [
+                {
+                    "consumer": "close_advice",
+                    "legacy_rows_requested": True,
+                }
+            ],
+        },
+    )
     now = datetime(2026, 7, 13, 10, tzinfo=timezone.utc)
 
     def runtime_status(_tool, payload):
@@ -539,7 +634,20 @@ def test_single_market_day_end_refresh_preserves_other_market(
         instance_id="test-instance",
         ledger_probe_path=ledger_path,
     )
-    service.refresh(config_keys=["us", "hk"])
+    baseline = service.refresh(config_keys=["us", "hk"])
+    assert baseline["extensions"]["current_decision_migration"]["status"] == (
+        "shadow_ready"
+    )
+    service.artifact_repository.write_atomic(
+        {
+            **baseline,
+            "datasets": [
+                item
+                for item in baseline["datasets"]
+                if item["dataset_id"] != "om.lifecycle_evidence_summary"
+            ],
+        }
+    )
     us_only = service.refresh(
         config_keys=["us"],
         deep=True,
@@ -558,3 +666,188 @@ def test_single_market_day_end_refresh_preserves_other_market(
     }
     assert position_markets == {"us", "hk"}
     assert runtime_markets == {"us", "hk"}
+    assert us_only["extensions"]["current_decision_migration"]["status"] == (
+        "not_ready"
+    )
+    assert service.refresh(config_keys=["us", "hk"])["extensions"][
+        "current_decision_migration"
+    ]["status"] == "shadow_ready"
+
+
+def test_active_cutover_refresh_uses_current_projection_without_history_reads(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    ledger_path = tmp_path / "option_positions.sqlite3"
+    ledger_path.write_bytes(b"")
+    config_paths = {}
+    for key in ("us", "hk"):
+        config_path = tmp_path / f"config.{key}.json"
+        config_path.write_text("{}", encoding="utf-8")
+        config_paths[key] = config_path
+    cfg = {"accounts": ["lx"]}
+    monkeypatch.setattr(
+        service_module,
+        "load_runtime_config",
+        lambda *, config_key: (config_paths[config_key], cfg),
+    )
+    monkeypatch.setattr(
+        service_module,
+        "infer_runtime_config_market",
+        lambda *, config_path, **_kwargs: config_path.stem.split(".")[-1],
+    )
+    monkeypatch.setattr(
+        service_module,
+        "read_quality_hot_path_cutover_receipt",
+        lambda _path: {"schema_version": "receipt.v1", "status": "active"},
+    )
+    fake_repo = object()
+    monkeypatch.setattr(
+        service_module,
+        "open_trade_reconciliation_evidence_repo",
+        lambda _path: fake_repo,
+    )
+    current_reads: list[str] = []
+
+    def read_current(_repo, *, account: str, now_ms: int) -> dict:
+        assert _repo is fake_repo
+        assert now_ms > 0
+        current_reads.append(account)
+        return _trusted_empty_current_projection()
+
+    monkeypatch.setattr(
+        service_module,
+        "read_current_decision_projection",
+        read_current,
+    )
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("ordinary current-only refresh read lifetime history")
+
+    monkeypatch.setattr(service_module, "build_ledger_datasets", forbidden)
+    monkeypatch.setattr(
+        service_module,
+        "lifecycle_account_coherent_facts",
+        forbidden,
+    )
+    monkeypatch.setattr(service_module, "build_lifecycle_datasets", forbidden)
+
+    def runtime_status(_tool, payload):
+        return {
+            "ok": True,
+            "data": {
+                "config": {"config_key": payload["config_key"]},
+                "summary": {"ok": True},
+                "ledger_store": {"sqlite_path": str(ledger_path)},
+                "trade_intake": {"holdings_sync": {"enabled": False}, "sources": []},
+                "service_profile": {"loaded": True},
+            },
+        }
+
+    service = OMQualityService(
+        artifact_repository=QualityArtifactRepository(tmp_path / "status.json"),
+        control_repository=QualityControlStateRepository(tmp_path / "control.json"),
+        opend_adapter=_OpenD(),
+        runtime_status_fn=runtime_status,
+        now_fn=lambda: datetime(2026, 7, 13, 10, tzinfo=timezone.utc),
+        ledger_probe_path=tmp_path / "missing-probe.sqlite3",
+        cutover_receipt_path=tmp_path / "cutover.json",
+    )
+    with pytest.raises(
+        ValueError,
+        match="first current-only quality refresh must publish both markets",
+    ):
+        service.refresh(config_keys=["us"])
+    assert service.artifact_repository.read() is None
+
+    payload = service.refresh(config_keys=["us", "hk"])
+
+    assert current_reads == ["lx", "lx"]
+    ids = [item["dataset_id"] for item in payload["datasets"]]
+    assert "om.lifecycle_evidence_summary" in ids
+    assert "om.lifecycle_evidence" not in ids
+    assert "om.lifecycle_history" not in ids
+    assert payload["extensions"]["current_decision_migration"]["status"] == (
+        "cutover_active"
+    )
+    assert payload["extensions"]["quality_hot_path_cutover"]["status"] == (
+        "active"
+    )
+
+    partial = service.refresh(config_keys=["us"])
+    lifecycle_markets = {
+        item["scope"]["market"]
+        for item in partial["datasets"]
+        if item["dataset_id"] == "om.lifecycle_evidence_summary"
+    }
+    assert lifecycle_markets == {"us", "hk"}
+    assert not {
+        item["dataset_id"]
+        for item in partial["datasets"]
+    } & {"om.lifecycle_evidence", "om.lifecycle_history"}
+
+
+def test_integrity_refresh_keeps_full_replay_in_separate_artifact(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    ledger_path = tmp_path / "option_positions.sqlite3"
+    SQLiteOptionPositionsRepository(ledger_path)
+    config_path = tmp_path / "config.us.json"
+    config_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        service_module,
+        "load_runtime_config",
+        lambda **_kwargs: (config_path, {"accounts": ["lx"]}),
+    )
+    monkeypatch.setattr(
+        service_module,
+        "infer_runtime_config_market",
+        lambda **_kwargs: "US",
+    )
+    monkeypatch.setattr(
+        service_module,
+        "read_quality_hot_path_cutover_receipt",
+        lambda _path: {"schema_version": "receipt.v1", "status": "active"},
+    )
+    replay_calls: list[int] = []
+    original = service_module.build_ledger_datasets
+
+    def counted_replay(**kwargs):
+        replay_calls.append(1)
+        return original(**kwargs)
+
+    monkeypatch.setattr(service_module, "build_ledger_datasets", counted_replay)
+
+    def runtime_status(_tool, _payload):
+        return {
+            "ok": True,
+            "data": {
+                "config": {"config_key": "us"},
+                "summary": {"ok": True},
+                "ledger_store": {"sqlite_path": str(ledger_path)},
+                "trade_intake": {"holdings_sync": {"enabled": False}, "sources": []},
+                "service_profile": {"loaded": True},
+            },
+        }
+
+    main = QualityArtifactRepository(tmp_path / "status.json")
+    integrity = QualityArtifactRepository(tmp_path / "integrity.json")
+    service = OMQualityService(
+        artifact_repository=main,
+        integrity_artifact_repository=integrity,
+        control_repository=QualityControlStateRepository(tmp_path / "control.json"),
+        opend_adapter=_OpenD(),
+        runtime_status_fn=runtime_status,
+        now_fn=lambda: datetime(2026, 7, 13, 10, tzinfo=timezone.utc),
+        ledger_probe_path=ledger_path,
+    )
+    payload = service.refresh_integrity(config_keys=["us"])
+
+    assert replay_calls == [1]
+    assert payload["extensions"]["integrity_refresh"] is True
+    assert payload["extensions"]["quality_hot_path_cutover"]["reason"] == (
+        "integrity_refresh"
+    )
+    assert main.read() is None
+    assert service.read_integrity_published() == payload
